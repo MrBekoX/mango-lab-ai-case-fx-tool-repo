@@ -5,6 +5,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# See run.sh -- the environment always wins over .env.
+if [ -f .env ]; then
+  while IFS='=' read -r key value; do
+    key=${key%%[![:alnum:]_]*}
+    [ -n "$key" ] || continue
+    if [ -z "${!key-}" ]; then export "$key=$value"; fi
+  done < <(tr -d '\r' < .env)
+fi
+
 VENV=.venv
 if [ ! -d "$VENV" ]; then
   BOOTSTRAP="$(command -v python3 || command -v python)"

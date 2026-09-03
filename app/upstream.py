@@ -8,8 +8,8 @@ raises `FxError`. It never invents either one.
 
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 import re
 from datetime import date
 from decimal import Decimal
@@ -17,25 +17,31 @@ from decimal import Decimal
 import httpx
 
 from .cache import TTLCache
+from .config import upstream_base
 from .errors import FxError
-
-# The documented default. $FX_UPSTREAM_BASE replaces it entirely, so no request
-# URL is ever built from a host baked into the code.
-DEFAULT_BASE = "https://api.frankfurter.dev"
 
 # httpx counts each phase separately -- there is no total-request budget -- so
 # these are per-phase limits, not a promise that a call returns within 5s.
 TIMEOUT = httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=5.0)
+# The discovery probe is optional, so it is not allowed to cost much.
+PROBE_TIMEOUT = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
 
 # Long enough to spare the upstream a burst of identical questions, short enough
 # that the afternoon's publication is picked up without a restart.
 SHORT_TTL = 300.0
 
-_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The ECB's longest run of unpublished days is a holiday week. A gap wider than
+# this means the provider is stale, not that the calendar is quiet, and serving
+# it would be a confidently wrong number.
+MAX_FALLBACK_DAYS = 10
 
+# No real reference rate lives outside this range. Values that do would survive
+# validation and then round to 0.00 on the way out.
+MIN_RATE = Decimal("1e-12")
+MAX_RATE = Decimal("1e12")
 
-def configured_base() -> str:
-    return (os.environ.get("FX_UPSTREAM_BASE") or DEFAULT_BASE).rstrip("/")
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_CURRENCY_CODE = re.compile(r"[A-Za-z]{3}")
 
 
 def _ttl_for(asked: str, rate_date: str, today: str) -> float | None:
@@ -49,6 +55,26 @@ def _ttl_for(asked: str, rate_date: str, today: str) -> float | None:
     if rate_date == asked and asked < today:
         return None
     return SHORT_TTL
+
+
+def _currency_set(payload: object) -> frozenset[str] | None:
+    """The provider's currency codes, or None if this is not a currency list.
+
+    A 200 is not proof of one. Gateways and CDNs answer with 200-wrapped error
+    bodies, and mistaking `{"message": "Not Found"}` for the currency list would
+    have us telling a customer that EUR does not exist -- confidently, and for
+    as long as the process lives.
+    """
+    if not isinstance(payload, dict) or len(payload) < 2:
+        return None
+    codes = set()
+    for code, name in payload.items():
+        if not isinstance(code, str) or not _CURRENCY_CODE.fullmatch(code):
+            return None
+        if not isinstance(name, str):
+            return None
+        codes.add(code.upper())
+    return frozenset(codes)
 
 
 def _reject_json_constant(name: str) -> None:
@@ -92,7 +118,7 @@ def _validated_rate(payload: dict, base: str, quote: str) -> tuple[Decimal, str]
     fallback.
     """
     rate_date = payload.get("date")
-    if not isinstance(rate_date, str) or not _ISO_DATE.match(rate_date):
+    if not isinstance(rate_date, str) or not _ISO_DATE.fullmatch(rate_date):
         raise FxError(
             "upstream_invalid_response",
             "The rate provider did not say which day its rate belongs to.",
@@ -136,7 +162,7 @@ def _validated_rate(payload: dict, base: str, quote: str) -> tuple[Decimal, str]
             f"The provider gave {rate!r} as the {base}/{quote} rate, which is not a number.",
         )
     rate = Decimal(rate)
-    if not rate.is_finite() or rate <= 0:
+    if not rate.is_finite() or not MIN_RATE <= rate <= MAX_RATE:
         raise FxError(
             "upstream_invalid_response",
             f"The provider gave {rate} as the {base}/{quote} rate, which cannot be a real exchange rate.",
@@ -150,11 +176,12 @@ class Upstream:
 
     def __init__(self, client: httpx.AsyncClient, base: str | None = None) -> None:
         self._client = client
-        self._base = (configured_base() if base is None else base.rstrip("/"))
+        self._base = upstream_base() if base is None else base.rstrip("/")
         # Which path prefix this upstream serves under. None means "not known
         # yet"; a base that already carries /v1 needs nothing added.
         self._prefix: str | None = "" if self._base.endswith("/v1") else None
         self._probed = False
+        self._probe_lock = asyncio.Lock()
         self._currencies: frozenset[str] | None = None
         self._rates = TTLCache()
 
@@ -174,32 +201,46 @@ class Upstream:
         """
         if self._probed:
             return
-        self._probed = True
-        for prefix in self._candidates():
-            try:
-                response = await self._request(f"{self._base}{prefix}/currencies", None)
-            except FxError:
-                # Unreachable right now, not absent. Worth asking again later.
-                self._probed = False
+        async with self._probe_lock:
+            # Two requests arriving together must not see different worlds: one
+            # answering "unknown currency" while the other says "no rate" would
+            # make the reason we give depend on timing.
+            if self._probed:
                 return
-            if response.status_code != 200:
-                continue
-            self._prefix = prefix
-            try:
-                payload = json.loads(response.content)
-            except ValueError:
-                return
-            if isinstance(payload, dict) and payload:
-                self._currencies = frozenset(str(code).upper() for code in payload)
-            return
+            for prefix in self._candidates():
+                try:
+                    response = await self._request(
+                        f"{self._base}{prefix}/currencies", None, PROBE_TIMEOUT
+                    )
+                except FxError:
+                    # Unreachable right now, not absent. Worth asking again.
+                    return
+                if response.status_code != 200:
+                    continue
+                try:
+                    payload = json.loads(response.content)
+                except ValueError:
+                    break
+                codes = _currency_set(payload)
+                if codes is None:
+                    break
+                self._prefix = prefix
+                self._currencies = codes
+                break
+            self._probed = True
 
     # -- fetching ----------------------------------------------------------
 
     async def _request(
-        self, url: str, params: dict[str, str] | None
+        self,
+        url: str,
+        params: dict[str, str] | None,
+        timeout: httpx.Timeout | None = None,
     ) -> httpx.Response:
         try:
-            return await self._client.get(url, params=params)
+            if timeout is None:
+                return await self._client.get(url, params=params)
+            return await self._client.get(url, params=params, timeout=timeout)
         except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
             # ConnectTimeout is a subclass of TimeoutException, so it has to be
             # caught first: an upstream we cannot reach is unavailable, not slow.
@@ -219,11 +260,13 @@ class Upstream:
         response = None
         for prefix in self._candidates():
             response = await self._request(f"{self._base}{prefix}/{path}", params)
-            if response.status_code != 404:
-                # Only a non-404 proves which prefix this upstream serves under.
-                # A 404 is ambiguous -- it may be a real "no rate" answer -- so
-                # we never let one lock in a prefix.
+            if response.is_success:
+                # Only a success proves which prefix this upstream serves under.
+                # A 500 proves nothing, and a 404 may be a real "no rate" answer,
+                # so neither is allowed to lock one in.
                 self._prefix = prefix
+                break
+            if response.status_code != 404:
                 break
         assert response is not None  # _candidates() is never empty
         return response
@@ -263,7 +306,7 @@ class Upstream:
 
         if response.status_code == 404:
             raise self._no_rate_error(base, quote, on)
-        if response.status_code != 200:
+        if not response.is_success:
             raise FxError(
                 "upstream_error",
                 f"The rate provider answered with HTTP {response.status_code}.",
@@ -299,13 +342,23 @@ class Upstream:
                 f"cannot belong to a day later than the one asked about.",
             )
 
-        entry = (rate, rate_date)
-        self._rates.put(key, entry, _ttl_for(asked, rate_date, today))
-        if key[2] != rate_date:
-            # File the same rate under the day it actually belongs to, on that
-            # day's own terms: asked for a Saturday, it is Friday's rate, and a
-            # later question about Friday should get it straight from here.
-            self._rates.put(
-                (base, quote, rate_date), entry, _ttl_for(rate_date, rate_date, today)
+        gap = (date.fromisoformat(asked) - date.fromisoformat(rate_date)).days
+        if gap > MAX_FALLBACK_DAYS:
+            # Falling back over a weekend is normal; falling back over years
+            # means the provider is frozen, and the answer would be wrong by
+            # whatever the market did in between.
+            raise FxError(
+                "rate_unavailable",
+                f"The newest {base}/{quote} rate the provider offers for {asked} is "
+                f"from {rate_date}, {gap} days earlier -- too far back to answer with.",
             )
+
+        entry = (rate, rate_date)
+        ttl = _ttl_for(asked, rate_date, today)
+        self._rates.put(key, entry, ttl)
+        if key[2] != rate_date:
+            # File the same rate under the day it actually belongs to, on the
+            # same terms. Giving this entry a longer life than the answer it came
+            # from would let one stale reply become a permanent fact.
+            self._rates.put((base, quote, rate_date), entry, ttl)
         return entry
