@@ -15,16 +15,14 @@ PORT=9000 ./run.sh
 FX_UPSTREAM_BASE=http://localhost:9999 ./run.sh
 ```
 
-Configuration is read in this order: **environment → `.env` → `.env.example`**.
-No provider host is written in the Python at all; `.env.example` is committed and
-carries the documented default (`https://api.frankfurter.dev`), `.env` is local
-and untracked, and anything exported in the environment beats both — so a stale
-file can never redirect the service away from the upstream you pointed it at.
+Config order: **environment → `.env` → `.env.example`**. No provider host is
+written in the Python; the committed `.env.example` carries the documented
+default, `.env` is local and untracked, and the environment beats both.
 
 **One thing to know:** the real API serves under `/v1`, which the documented
 default base does not include. Rather than assume, the service tries
-`<base>/v1/…` first, falls back to `<base>/…`, and remembers whichever answered.
-A fake upstream can serve at either.
+`<base>/v1/…`, falls back to `<base>/…`, and remembers whichever answered — so a
+fake upstream can serve at either.
 
 ## Test
 
@@ -58,13 +56,13 @@ case-insensitive.
 }
 ```
 
-- **`rate_date`** — the day the rate actually belongs to, read from the
-  provider's own `date` field. Never derived, never assumed.
-- **`asked_date`** — the day you asked about. With no `date`, that is today, so
-  asking "what is it now?" on a Saturday still shows the rate is Friday's.
+- **`rate_date`** — the day the rate belongs to, read from the provider's own
+  `date` field. Never derived.
+- **`asked_date`** — the day you asked about; with no `date`, today. So asking
+  "what is it now?" on a Saturday still shows the rate is Friday's.
 
-When the two differ, the rate is from an earlier publication and the caller can
-say which day the number is from. Failures return a status and:
+When they differ, the rate is from an earlier publication. Failures return a
+status and:
 
 ```json
 { "error": "date_in_future", "message": "2030-01-01 is in the future; the ECB has not published a rate for it." }
@@ -111,26 +109,25 @@ say which day the number is from. Failures return a status and:
 
 ## Decisions worth knowing
 
-- **`from == to` is an error, not `1.0`.** Answering would mean putting a rate in
-  a 200 that no ECB publication stands behind, and giving it a date. The
-  provider rejects the pair too. The message says the amount is unchanged, so
-  the model can still answer the customer.
-- **The provider's answer is checked before it is believed.** The base currency
-  has to match, rates have to be quoted per one unit, the requested currency has
-  to be present, and the rate has to be a plausible finite number. Reading
-  `rates[to]` without that is how a service reports one currency's rate as
-  another's.
-- **A repeated question does not re-ask the provider.** The cache key is
-  `(from, to, date)` — not just the pair, so a question about 2015 can never be
-  answered with today's rate. A rate for a day already over is kept
-  indefinitely; anything else expires in five minutes, because today's rate is
-  published mid-afternoon and a day we fell back from may still get its own.
-- **`source` is a provenance label, not the address fetched from,** so it does
-  not follow `FX_UPSTREAM_BASE`. It says where the numbers come from.
+- **`from == to` is an error, not `1.0`** — answering would put a rate in a 200
+  that no ECB publication stands behind, and date it. The message says the
+  amount is unchanged, so the model can still answer.
+- **The provider's answer is checked before it is believed:** base currency
+  matches, rates quoted per one unit, requested currency present, rate finite
+  and plausible. Reading `rates[to]` without that is how a service reports one
+  currency's rate as another's.
+- **A repeat does not re-ask the provider.** The key is `(from, to, date)` — not
+  just the pair — so a question about 2015 can never be answered with today's
+  rate. A day already over is kept indefinitely; anything else for five minutes.
+- **`source` is a provenance label,** not the address fetched from, so it does
+  not follow `FX_UPSTREAM_BASE`.
 
 ### Known limits
 
 `result` is rounded to two decimals for every currency, which is wrong for JPY.
 No retries. No single-flight, so "does not re-ask" holds for sequential calls;
-two simultaneous identical requests will both go out. No auth or rate limiting —
+two simultaneous identical requests will both go out. The currency list is
+fetched once and kept for the life of the process. `/tools/convert` is the only
+endpoint written here; FastAPI's own `/docs` and `/openapi.json` are left on,
+since the schema is how an agent discovers the tool. No auth or rate limiting —
 none was asked for.
