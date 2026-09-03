@@ -9,6 +9,7 @@ number.
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -38,6 +39,9 @@ KNOWN_PARAMS = frozenset({"amount", "from", "to", "date"})
 # The ECB publishes on Frankfurt time, so that is the calendar a date is
 # compared against.
 TZ_NAME = "Europe/Berlin"
+
+_ISO_DATE_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}")
+_PLAIN_NUMBER = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
 
 
 @asynccontextmanager
@@ -71,6 +75,22 @@ def _normalise(value):
     return value.upper() if isinstance(value, str) else value
 
 
+def _plain_number(value):
+    # Decimal reads "250_0" as 2500, which would quietly convert ten times the
+    # amount the caller wrote.
+    if isinstance(value, str) and not _PLAIN_NUMBER.fullmatch(value):
+        raise ValueError("amount must be written as a plain number")
+    return value
+
+
+def _iso_date_only(value):
+    # Pydantic reads "1756339200" as a Unix timestamp, so a stray number would
+    # be answered about a completely different day with nothing looking wrong.
+    if isinstance(value, str) and not _ISO_DATE_TEXT.fullmatch(value):
+        raise ValueError("date must be written as YYYY-MM-DD")
+    return value
+
+
 # Upper-cased before the pattern runs, so `eur` is accepted and `EURO` is not.
 Currency = Annotated[
     str,
@@ -88,6 +108,7 @@ async def convert(
     request: Request,
     amount: Annotated[
         Decimal,
+        BeforeValidator(_plain_number),
         Query(gt=0, le=MAX_AMOUNT, allow_inf_nan=False, description="How much to convert"),
     ],
     from_: Annotated[Currency, Query(alias="from")],
@@ -95,18 +116,11 @@ async def convert(
     upstream: Annotated[Upstream, Depends(get_upstream)],
     on: Annotated[
         date | None,
+        BeforeValidator(_iso_date_only),
         Query(alias="date", description="YYYY-MM-DD; omit for the latest published rate"),
     ] = None,
 ) -> dict:
-    # A caller that sends `on=` instead of `date=` has asked about a specific day.
-    # Silently ignoring it would answer a different question with no sign of it.
-    unknown = sorted(set(request.query_params) - KNOWN_PARAMS)
-    if unknown:
-        raise FxError(
-            "unknown_parameter",
-            f"This endpoint does not accept {', '.join(unknown)}. "
-            f"It takes amount, from, to and an optional date.",
-        )
+    _check_parameters(request)
 
     if from_ == to:
         # Answering 1.0 would mean putting a rate in the response that no ECB
@@ -130,11 +144,12 @@ async def convert(
     try:
         result = (amount * rate).quantize(CENTS, rounding=ROUND_HALF_UP)
     except (InvalidOperation, OverflowError):
+        # The rate is range-checked in upstream.py, so an overflow here is the
+        # amount's doing and blaming the caller is honest.
         raise FxError(
             "invalid_amount", "That amount is too large to convert precisely."
         ) from None
 
-    asked_date = asked.isoformat()
     return {
         "amount": amount,
         "from": from_,
@@ -143,17 +158,38 @@ async def convert(
         "result": result,
         # The day the rate belongs to, straight from the provider...
         "rate_date": rate_date,
-        # ...and the day the caller asked about. When they differ, the caller is
-        # holding an older publication and has to be able to say so.
-        "asked_date": asked_date,
-        "rate_is_from_earlier_date": rate_date < asked_date,
+        # ...and the day the caller asked about. When the two differ the caller
+        # is holding an older publication, and can tell the customer which day
+        # the number is from.
+        "asked_date": asked.isoformat(),
         "source": SOURCE,
     }
 
 
-@app.get("/health")
-async def health() -> dict:
-    return {"ok": True}
+def _check_parameters(request: Request) -> None:
+    """Refuse a query that says something we would otherwise ignore.
+
+    A caller sending `on=` instead of `date=`, or `date=` twice, has asked about
+    a particular day. Answering about a different one without saying so is the
+    failure this service exists to prevent.
+    """
+    names = [name for name, _ in request.query_params.multi_items()]
+
+    unknown = sorted(set(names) - KNOWN_PARAMS)
+    if unknown:
+        raise FxError(
+            "unknown_parameter",
+            f"This endpoint does not accept {', '.join(unknown)}. "
+            f"It takes amount, from, to and an optional date.",
+        )
+
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise FxError(
+            "invalid_request",
+            f"Give each parameter once; {', '.join(repeated)} appeared more than "
+            f"once and only one of the values would have been used.",
+        )
 
 
 # -- error responses -------------------------------------------------------
@@ -177,16 +213,16 @@ async def _validation_error(
 
 
 @app.exception_handler(StarletteHTTPException)
-async def _routing_error(
-    request: Request, exc: StarletteHTTPException
-) -> JSONResponse:
+async def _routing_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     # Registered on Starlette's HTTPException, not FastAPI's: FastAPI's is a
     # subclass, so handling only that one would let the router's own 404 and 405
     # answer with FastAPI's default {"detail": ...} body instead of ours.
     code = _ROUTING_CODES.get(exc.status_code)
     if code is None:
         code = "internal_error" if exc.status_code >= 500 else "invalid_request"
-    return _error(code, _ROUTING_MESSAGES.get(exc.status_code, str(exc.detail)), exc.status_code)
+    return _error(
+        code, _ROUTING_MESSAGES.get(exc.status_code, str(exc.detail)), exc.status_code
+    )
 
 
 @app.exception_handler(Exception)
@@ -222,6 +258,7 @@ _FIELD_ORDER = ("amount", "from", "to", "date")
 _AMOUNT_MESSAGES = {
     "missing": "amount is required.",
     "decimal_parsing": "amount must be a number, for example 250 or 250.75.",
+    "value_error": "amount must be a plain number, for example 250 or 250.75.",
     "greater_than": "amount must be greater than zero.",
     "finite_number": "amount must be a finite number.",
     "less_than_equal": f"amount must not exceed {MAX_AMOUNT:f}.",
@@ -231,7 +268,9 @@ _AMOUNT_MESSAGES = {
 def _describe(exc: RequestValidationError) -> tuple[str, str]:
     problems: dict[str, str] = {}
     for error in exc.errors():
-        problems.setdefault(str(error["loc"][-1]), error["type"])
+        location = error.get("loc") or ()
+        if location:
+            problems.setdefault(str(location[-1]), error["type"])
     for field in _FIELD_ORDER:
         if field in problems:
             return _FIELD_CODE[field], _explain(field, problems[field])

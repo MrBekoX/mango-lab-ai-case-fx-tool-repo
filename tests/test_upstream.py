@@ -4,6 +4,7 @@ The provider is the only source of a rate and of the day it belongs to, so most
 of these tests are about refusing a payload rather than reading one.
 """
 
+import asyncio
 from datetime import date
 from decimal import Decimal
 
@@ -236,3 +237,72 @@ def test_a_settled_past_rate_is_kept(monkeypatch):
     clock[0] += 100_000
     go()
     assert len(rate_calls(calls)) == 1
+
+
+# -- believing only what is worth believing --------------------------------
+
+
+def test_a_200_that_is_not_a_currency_list_is_not_believed():
+    """Gateways and CDNs answer with 200-wrapped error bodies. Taking one for
+    the currency list would have us telling a customer that EUR does not
+    exist -- confidently, and for as long as the process lives."""
+    routes = dict(GOOD) | {"/v1/currencies": (200, '{"message":"Not Found"}')}
+    assert fetch(routes)[2]() == (Decimal("56.1718"), FRIDAY)
+
+
+def test_without_a_believable_currency_list_the_reason_stays_open():
+    routes = {"/v1/currencies": (200, '{"message":"Not Found"}')}
+    assert refusal(routes, quote="XYZ").code == "rate_unavailable"
+
+
+@pytest.mark.parametrize("rate", ["1e-400", "1e-13", "1e13", "1e400"])
+def test_a_rate_outside_any_plausible_range_is_refused(rate):
+    """1e-400 survives an is_finite() check and then rounds to 0.00 on the way
+    out -- a silent zero wearing a 200."""
+    routes = dict(GOOD) | {f"/v1/{FRIDAY}": (200, rates_body(rate=rate))}
+    assert refusal(routes).code == "upstream_invalid_response"
+
+
+def test_a_fallback_from_years_ago_is_refused_rather_than_served():
+    """A frozen mirror answers honestly -- it says the rate is from 2019. The
+    date is not the problem; presenting it as an answer for today is."""
+    routes = dict(GOOD) | {f"/v1/{FRIDAY}": (200, rates_body(on="2019-01-02"))}
+    error = refusal(routes)
+    assert error.code == "rate_unavailable"
+    assert "2019-01-02" in error.message
+
+
+def test_a_holiday_length_gap_is_still_answered():
+    routes = dict(GOOD) | {f"/v1/{FRIDAY}": (200, rates_body(on="2026-08-24"))}
+    assert fetch(routes)[2]() == (Decimal("56.1718"), "2026-08-24")
+
+
+def test_a_server_error_does_not_lock_in_the_wrong_prefix():
+    """A 404 may be a real answer and a 500 proves nothing; neither should
+    settle which layout this upstream serves."""
+    routes = {f"/v1/{FRIDAY}": (500, "{}"), f"/{FRIDAY}": (200, rates_body())}
+    upstream, _, go = fetch(routes)
+    with pytest.raises(FxError) as caught:
+        go()
+    assert caught.value.code == "upstream_error"
+
+    routes.pop(f"/v1/{FRIDAY}")  # the /v1 path stops erroring and starts 404ing
+    assert go() == (Decimal("56.1718"), FRIDAY)
+
+
+def test_two_requests_arriving_together_are_given_the_same_reason():
+    """The discovery probe runs once. If a second caller slips past it while it
+    is still in flight, the two get different explanations for the same
+    question -- and one of them is a guess."""
+    upstream, _ = make_upstream(GOOD)
+
+    async def both():
+        return await asyncio.gather(
+            upstream.get_rate("EUR", "XYZ", FRIDAY_DATE, TODAY),
+            upstream.get_rate("EUR", "XYZ", FRIDAY_DATE, TODAY),
+            return_exceptions=True,
+        )
+
+    first, second = run(both())
+    assert isinstance(first, FxError) and isinstance(second, FxError)
+    assert first.code == second.code == "unknown_currency"

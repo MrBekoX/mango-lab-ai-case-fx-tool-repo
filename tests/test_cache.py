@@ -95,9 +95,7 @@ def test_a_cache_that_cannot_hold_anything_is_a_bug():
         TTLCache(max_entries=0)
 
 
-@pytest.mark.parametrize(
-    "code, status",
-    [
+DOCUMENTED_CODES = [
         ("invalid_amount", 400),
         ("invalid_currency", 400),
         ("invalid_date", 400),
@@ -115,16 +113,19 @@ def test_a_cache_that_cannot_hold_anything_is_a_bug():
         ("upstream_invalid_response", 502),
         ("upstream_timeout", 504),
         ("internal_error", 500),
-    ],
-)
+]
+
+
+@pytest.mark.parametrize("code, status", DOCUMENTED_CODES)
 def test_each_error_code_keeps_the_status_the_contract_promises(code, status):
     assert FxError(code, "x").status_code == status
 
 
-def test_the_status_table_has_no_codes_the_contract_does_not_list():
-    """Guards the README's error table against silently growing a code nobody
-    documented."""
-    assert len(ERROR_STATUS) == 17
+def test_the_status_table_matches_the_documented_one_exactly():
+    """A new code that nobody added to the README's table, or a renamed one,
+    should fail here rather than reach a caller."""
+    documented = {code for code, _ in DOCUMENTED_CODES}
+    assert set(ERROR_STATUS) == documented
 
 
 def test_an_unknown_error_code_is_a_bug_not_a_500():

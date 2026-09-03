@@ -21,7 +21,6 @@ SHAPE = {
     "result",
     "rate_date",
     "asked_date",
-    "rate_is_from_earlier_date",
     "source",
 }
 
@@ -36,7 +35,9 @@ ASK = {"amount": "250", "from": "EUR", "to": "TRY", "date": FRIDAY}
 
 def convert(client, **overrides):
     params = {**ASK, **overrides}
-    return client.get("/tools/convert", params={k: v for k, v in params.items() if v is not None})
+    return client.get(
+        "/tools/convert", params={k: v for k, v in params.items() if v is not None}
+    )
 
 
 # -- the answer -----------------------------------------------------------
@@ -52,16 +53,15 @@ def test_a_business_day_answers_with_the_rate_for_that_day(client):
     assert body["rate"] == 56.1718
     assert body["result"] == 14042.95  # 250 x 56.1718
     assert body["rate_date"] == body["asked_date"] == FRIDAY
-    assert body["rate_is_from_earlier_date"] is False
     assert body["source"] == "ECB via frankfurter.dev"
 
 
 def test_numbers_are_json_numbers_not_strings(client):
     """A model reading `"rate": "56.1718"` has to unquote it first, and the
-    brief's own example shows a bare number."""
-    api, _ = client(GOOD)
+    brief's example shows a bare number."""
+    api, _ = client(GOOD | {f"/v1/{FRIDAY}": (200, rates_body(rate="56.1718"))})
     raw = json.loads(convert(api).text)
-    assert isinstance(raw["rate"], float)
+    assert isinstance(raw["rate"], float) and raw["rate"] == 56.1718
     assert isinstance(raw["result"], float)
     assert raw["amount"] == 250 and not isinstance(raw["amount"], str)
 
@@ -74,29 +74,25 @@ def test_a_weekend_says_which_day_the_rate_is_really_from(client):
 
     assert body["asked_date"] == SATURDAY
     assert body["rate_date"] == FRIDAY
-    assert body["rate_is_from_earlier_date"] is True
+    assert body["rate_date"] < body["asked_date"]
 
 
 def test_asking_without_a_date_still_reveals_a_stale_rate(client):
     """Today is a Saturday and the newest publication is Friday's. The caller
-    asked for "now", so `asked_date` is today -- otherwise the two dates would
-    always match and the staleness signal would be dead on the most common
-    call there is."""
-    api, _ = client(
-        GOOD | {"/v1/latest": (200, rates_body(on=FRIDAY))}, now=SATURDAY
-    )
+    asked about "now", so `asked_date` is today -- otherwise the two dates would
+    always match and the difference would be invisible on the most common call
+    there is."""
+    api, _ = client(GOOD | {"/v1/latest": (200, rates_body(on=FRIDAY))}, now=SATURDAY)
     body = convert(api, date=None).json()
 
     assert body["asked_date"] == SATURDAY
     assert body["rate_date"] == FRIDAY
-    assert body["rate_is_from_earlier_date"] is True
 
 
-def test_asking_without_a_date_on_a_published_day_is_not_flagged(client):
+def test_asking_without_a_date_on_a_published_day_matches(client):
     api, _ = client(GOOD)
     body = convert(api, date=None).json()
     assert body["rate_date"] == body["asked_date"] == TODAY
-    assert body["rate_is_from_earlier_date"] is False
 
 
 def test_ten_decimal_places_survive_the_arithmetic(client):
@@ -115,12 +111,6 @@ def test_lowercase_currency_codes_are_accepted(client):
 # -- refusals that never reach the provider --------------------------------
 
 
-def _refused(client, routes=GOOD, **overrides):
-    api, calls = client(routes)
-    response = convert(api, **overrides)
-    return response, calls
-
-
 @pytest.mark.parametrize(
     "overrides, code",
     [
@@ -137,13 +127,21 @@ def _refused(client, routes=GOOD, **overrides):
         ({"amount": "inf"}, "invalid_amount"),
         ({"amount": "abc"}, "invalid_amount"),
         ({"amount": "1e13"}, "invalid_amount"),
+        # Decimal would read this as 2500 -- ten times what was written.
+        ({"amount": "250_0"}, "invalid_amount"),
+        ({"amount": "1_000"}, "invalid_amount"),
         ({"date": "2026-13-45"}, "invalid_date"),
         ({"date": "yesterday"}, "invalid_date"),
         ({"date": ""}, "invalid_date"),
+        # Pydantic would read a bare number as a Unix timestamp and answer
+        # about an entirely different day.
+        ({"date": "1756339200"}, "invalid_date"),
+        ({"date": "0"}, "invalid_date"),
     ],
 )
 def test_a_bad_request_is_refused_without_asking_the_provider(client, overrides, code):
-    response, calls = _refused(client, **overrides)
+    api, calls = client(GOOD)
+    response = convert(api, **overrides)
     assert response.status_code == 400
     assert response.json()["error"] == code
     assert calls == [], "no request should reach the provider"
@@ -160,6 +158,19 @@ def test_an_unrecognised_parameter_is_refused_rather_than_ignored(client):
     assert response.status_code == 400
     assert response.json()["error"] == "unknown_parameter"
     assert "on" in response.json()["message"]
+    assert calls == []
+
+
+def test_a_parameter_given_twice_is_refused(client):
+    """Only one of the two values would be used, and the caller would have no
+    way to know which."""
+    api, calls = client(GOOD)
+    response = api.get(
+        f"/tools/convert?amount=250&from=EUR&to=TRY&date={FRIDAY}&date=2026-08-27"
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+    assert calls == []
 
 
 # -- refusals that come back from the provider -----------------------------
@@ -168,9 +179,24 @@ def test_an_unrecognised_parameter_is_refused_rather_than_ignored(client):
 @pytest.mark.parametrize(
     "routes, default, status, code",
     [
-        ({**GOOD, f"/v1/{FRIDAY}": httpx.ConnectError("refused")}, NOT_FOUND, 502, "upstream_unavailable"),
-        ({**GOOD, f"/v1/{FRIDAY}": httpx.ConnectTimeout("no route")}, NOT_FOUND, 502, "upstream_unavailable"),
-        ({**GOOD, f"/v1/{FRIDAY}": httpx.ReadTimeout("slow")}, NOT_FOUND, 504, "upstream_timeout"),
+        (
+            {**GOOD, f"/v1/{FRIDAY}": httpx.ConnectError("refused")},
+            NOT_FOUND,
+            502,
+            "upstream_unavailable",
+        ),
+        (
+            {**GOOD, f"/v1/{FRIDAY}": httpx.ConnectTimeout("no route")},
+            NOT_FOUND,
+            502,
+            "upstream_unavailable",
+        ),
+        (
+            {**GOOD, f"/v1/{FRIDAY}": httpx.ReadTimeout("slow")},
+            NOT_FOUND,
+            504,
+            "upstream_timeout",
+        ),
         ({**GOOD, f"/v1/{FRIDAY}": (500, "{}")}, NOT_FOUND, 502, "upstream_error"),
         (
             {**GOOD, f"/v1/{FRIDAY}": (200, "<html>oops</html>")},
@@ -194,12 +220,13 @@ def test_an_unrecognised_parameter_is_refused_rather_than_ignored(client):
         ({}, NOT_FOUND, 404, "rate_unavailable"),
     ],
 )
-def test_a_provider_problem_never_becomes_a_number(client, routes, default, status, code):
+def test_a_provider_problem_never_becomes_a_number(
+    client, routes, default, status, code
+):
     api, _ = client(routes, default=default)
     response = convert(api)
     assert response.status_code == status
-    assert response.json()["error"] == code
-    assert "rate" not in response.json(), "a failed conversion must not carry a rate"
+    assert response.json() == {"error": code, "message": response.json()["message"]}
 
 
 def test_an_unknown_currency_is_named_as_such(client):
@@ -207,6 +234,15 @@ def test_an_unknown_currency_is_named_as_such(client):
     response = convert(api, to="XYZ")
     assert response.status_code == 404
     assert response.json()["error"] == "unknown_currency"
+
+
+def test_a_rate_from_years_ago_is_refused_rather_than_served(client):
+    """A frozen mirror still answers, and its answer is still honestly dated.
+    Serving it anyway would be wrong by whatever the market did in between."""
+    api, _ = client(GOOD | {f"/v1/{FRIDAY}": (200, rates_body(on="2019-01-02"))})
+    response = convert(api)
+    assert response.status_code == 404
+    assert response.json()["error"] == "rate_unavailable"
 
 
 # -- the error envelope ----------------------------------------------------
@@ -244,7 +280,12 @@ def test_an_unexpected_crash_still_answers_in_the_error_shape(client, monkeypatc
 
 def test_every_failure_body_has_exactly_two_fields(client):
     api, _ = client(GOOD)
-    for overrides in ({"amount": "0"}, {"from": "EURO"}, {"date": "2099-01-01"}, {"to": "EUR"}):
+    for overrides in (
+        {"amount": "0"},
+        {"from": "EURO"},
+        {"date": "2099-01-01"},
+        {"to": "EUR"},
+    ):
         body = convert(api, **overrides).json()
         assert set(body) == {"error", "message"}
         assert body["message"].endswith(".") and " " in body["message"]
@@ -258,8 +299,3 @@ def test_repeating_the_same_question_does_not_reask_the_provider(client):
     first, second = convert(api).json(), convert(api).json()
     assert first == second
     assert len([c for c in calls if not c.url.path.endswith("/currencies")]) == 1
-
-
-def test_health_is_answerable_without_the_provider(client):
-    api, _ = client({})
-    assert api.get("/health").json() == {"ok": True}
