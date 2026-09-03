@@ -5,11 +5,12 @@
 **When the ECB published no rate for the day asked about, I answer — and say so.**
 The provider already falls back to the previous business day, and it tells you
 the truth in its `date` field. So `rate_date` is always that field, verbatim,
-and `asked_date` is what the caller sent. A ninth field,
-`rate_is_from_earlier_date`, makes the difference a boolean the model can branch
-on instead of a date comparison it has to do itself. Refusing weekends outright
-was the other option; it would have made the tool useless on two days in seven
-for no gain, since the model can say "that's Friday's rate" perfectly well.
+and `asked_date` is what the caller sent; when they differ the model can see it
+and say "that is Friday's rate". I did try an extra boolean saying the same
+thing, and took it back out — the brief's example response is eight fields and
+it already names those two dates as where the difference shows. Refusing
+weekends outright was the other option; it would have made the tool useless two
+days in seven for no gain.
 
 **The subtlety that nearly got me:** when no `date` is sent, the obvious move is
 `asked_date = rate_date`. That quietly kills the flag — it can never be `true` on
@@ -29,6 +30,14 @@ ECB publication stands behind, and give it a date. The provider rejects the pair
 too (422). The message says the amount is unchanged, so the model can still
 answer the customer.
 
+**No host is written in the code at all.** The base URL is read from the
+environment, then `.env`, then the committed `.env.example` that carries the
+documented default — one function in `app/config.py`, so "nothing hardcodes the
+host" is a claim you can check in one place. The environment wins over both
+files, because a stale `.env` silently redirecting the service away from the
+upstream someone pointed it at is exactly the class of failure this thing exists
+to prevent.
+
 **The `/v1` prefix is discovered, not assumed.** The brief's default base
 (`https://api.frankfurter.dev`) 404s on its own — the real API lives under `/v1`.
 Hardcoding the prefix would break against a fake upstream serving at the root;
@@ -44,9 +53,9 @@ encoding converts. `rate` is passed through untouched.
 Currency-aware rounding (`result` is 2 decimals for everything, which is wrong
 for JPY). Single-flight, so the "doesn't re-ask" guarantee holds under
 concurrency and not just sequentially. One retry on a connection failure.
-Structured logging with a request id. And I'd ask the reviewers two questions I
-had to guess at instead: whether their fake upstream serves at the root or under
-`/v1`, and whether they expect a 200 or an error for `from == to`.
+Structured logging with a request id. And I'd ask you two questions I had to
+guess at instead: whether your fake upstream serves at the root or under `/v1`,
+and whether you expect a 200 or an error for `from == to`.
 
 ## AI tools
 

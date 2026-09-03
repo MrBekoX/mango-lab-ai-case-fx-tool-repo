@@ -15,11 +15,16 @@ PORT=9000 ./run.sh
 FX_UPSTREAM_BASE=http://localhost:9999 ./run.sh
 ```
 
-`FX_UPSTREAM_BASE` defaults to `https://api.frankfurter.dev`; no host is
-hardcoded anywhere else. **One thing to know:** the real API serves under `/v1`,
-which the documented default does not include. Rather than assume, the service
-tries `<base>/v1/…` first, falls back to `<base>/…` on a 404, and remembers
-whichever answered — so a fake upstream can serve at either.
+Configuration is read in this order: **environment → `.env` → `.env.example`**.
+No provider host is written in the Python at all; `.env.example` is committed and
+carries the documented default (`https://api.frankfurter.dev`), `.env` is local
+and untracked, and anything exported in the environment beats both — so a stale
+file can never redirect the service away from the upstream you pointed it at.
+
+**One thing to know:** the real API serves under `/v1`, which the documented
+default base does not include. Rather than assume, the service tries
+`<base>/v1/…` first, falls back to `<base>/…`, and remembers whichever answered.
+A fake upstream can serve at either.
 
 ## Test
 
@@ -27,7 +32,7 @@ whichever answered — so a fake upstream can serve at either.
 ./test.sh
 ```
 
-105 tests, no network at all: every upstream response comes from an
+120 tests, no network at all: every upstream response comes from an
 `httpx.MockTransport`. Confirmed green with `FX_UPSTREAM_BASE` pointed at a
 closed port.
 
@@ -49,19 +54,17 @@ case-insensitive.
   "result": 14042.95,
   "rate_date": "2026-08-28",
   "asked_date": "2026-08-28",
-  "rate_is_from_earlier_date": false,
   "source": "ECB via frankfurter.dev"
 }
 ```
 
 - **`rate_date`** — the day the rate actually belongs to, read from the
   provider's own `date` field. Never derived, never assumed.
-- **`asked_date`** — the day you asked about. With no `date`, that is today.
-- **`rate_is_from_earlier_date`** — `true` when the two differ. A ninth field
-  beyond the brief's example: the two dates already carry the information, but a
-  boolean is what a caller branches on without doing date arithmetic.
+- **`asked_date`** — the day you asked about. With no `date`, that is today, so
+  asking "what is it now?" on a Saturday still shows the rate is Friday's.
 
-Failures return a status and:
+When the two differ, the rate is from an earlier publication and the caller can
+say which day the number is from. Failures return a status and:
 
 ```json
 { "error": "date_in_future", "message": "2030-01-01 is in the future; the ECB has not published a rate for it." }
@@ -72,30 +75,33 @@ Failures return a status and:
 | You ask about | It answers |
 |---|---|
 | A day the ECB published | `200`, `rate_date == asked_date` |
-| **A weekend or holiday** | `200` with the last publication before it. `rate_date` is that earlier day and the flag is `true`, so the model can tell the customer which day the number is from |
-| Nothing (`date` omitted) | `200` for the latest publication. `asked_date` is **today**, so asking on a Saturday still shows the rate is Friday's |
+| **A weekend or holiday** | `200` with the last publication before it, and `rate_date` is that earlier day |
+| Nothing (`date` omitted) | `200` for the latest publication, with `asked_date` set to today |
 | A date in the future | `400 date_in_future`, refused without touching the upstream |
 | A date before the series starts | `404 no_rate_for_date` |
 | A currency code that does not exist | `404 unknown_currency` (or `400 invalid_currency` if it is not three letters) |
 | The same currency twice | `400 same_currency` |
-| An amount that is missing, zero, negative, `nan` or `inf` | `400 invalid_amount`, no upstream request |
+| An amount that is missing, zero, negative, `nan`, `inf`, or written as `250_0` | `400 invalid_amount`, no upstream request |
 | An amount with ten decimal places | `200`. Kept exact end to end as a `Decimal`; only `result` is rounded, to 2 places, half up |
+| A `date` that is a bare number, or given twice | `400`. Pydantic would read `1756339200` as a Unix timestamp and answer about a different day |
 | An upstream that is slow, down, returns 500, or returns something that is not JSON | `502` or `504`. Never a rate, never a zero |
-| An upstream that answers a *different* question — wrong base currency, rates quoted per 100, a missing or later date, a rate of zero | `502 upstream_invalid_response` |
+| An upstream that answers a *different* question — wrong base currency, rates quoted per 100, a missing or later date, an implausible rate | `502 upstream_invalid_response` |
+| An upstream whose newest rate is more than ten days older than the day asked about | `404 rate_unavailable`. A holiday gap is normal; a frozen mirror is not |
 
 ## Error codes
 
 | Code | HTTP | Raised when |
 |---|---|---|
-| `invalid_amount` | 400 | `amount` missing, non-numeric, ≤ 0, non-finite, or above 1e12 |
+| `invalid_amount` | 400 | `amount` missing, not a plain number, ≤ 0, non-finite, or above 1e12 |
 | `invalid_currency` | 400 | `from`/`to` is not three letters |
-| `invalid_date` | 400 | `date` is not a calendar date in `YYYY-MM-DD` |
+| `invalid_date` | 400 | `date` is not a calendar date written as `YYYY-MM-DD` |
+| `invalid_request` | 400 | A parameter was given more than once |
 | `unknown_parameter` | 400 | A query parameter this endpoint does not accept |
 | `date_in_future` | 400 | `date` is after today (Europe/Berlin) |
 | `same_currency` | 400 | `from` and `to` are the same |
 | `unknown_currency` | 404 | The code is well formed but the ECB does not publish it |
 | `no_rate_for_date` | 404 | Both codes are known, but no rate exists for that day |
-| `rate_unavailable` | 404 | No rate, and the upstream offers no currency list to say which of the two reasons applies |
+| `rate_unavailable` | 404 | No usable rate, and either the upstream offers no currency list to say why, or the newest one is too old to serve |
 | `unknown_endpoint` / `method_not_allowed` | 404 / 405 | Wrong path or method |
 | `upstream_unavailable` | 502 | Could not reach the provider |
 | `upstream_error` | 502 | The provider returned an unexpected status |
@@ -109,6 +115,11 @@ Failures return a status and:
   a 200 that no ECB publication stands behind, and giving it a date. The
   provider rejects the pair too. The message says the amount is unchanged, so
   the model can still answer the customer.
+- **The provider's answer is checked before it is believed.** The base currency
+  has to match, rates have to be quoted per one unit, the requested currency has
+  to be present, and the rate has to be a plausible finite number. Reading
+  `rates[to]` without that is how a service reports one currency's rate as
+  another's.
 - **A repeated question does not re-ask the provider.** The cache key is
   `(from, to, date)` — not just the pair, so a question about 2015 can never be
   answered with today's rate. A rate for a day already over is kept
