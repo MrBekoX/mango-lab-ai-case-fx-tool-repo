@@ -13,9 +13,9 @@ weekends outright was the other option; it would have made the tool useless two
 days in seven for no gain.
 
 **The subtlety that nearly got me:** when no `date` is sent, the obvious move is
-`asked_date = rate_date`. That quietly kills the flag — it can never be `true` on
-the commonest call there is, so a Saturday "what's the rate now?" would report a
-two-day-old number as current. `asked_date` is today instead.
+`asked_date = rate_date`. That makes the two dates always agree on the commonest
+call there is, so a Saturday "what's the rate now?" would present a two-day-old
+number as current with nothing to notice. `asked_date` is today instead.
 
 **I don't trust the payload, I check it.** Before reading `rates[to]` the client
 confirms the provider answered the question actually asked: the base currency
