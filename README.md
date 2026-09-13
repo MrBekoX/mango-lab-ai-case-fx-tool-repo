@@ -1,129 +1,133 @@
-# Case study — Junior Software Engineer at mangolab
+# fx-tool
 
-Two small tasks, **about two and a half hours in total.** Please do not spend
-your weekend on this. If you run out of time, stop and write down what you would
-have done next — that answer counts too.
+One endpoint an agent can call to convert an amount between two currencies,
+using the ECB reference rates published by [frankfurter.dev](https://frankfurter.dev).
 
-Use Claude Code, Cursor, Copilot — whatever you normally use. That is how we work
-every day, and we would rather see you use it well than watch you avoid it. The
-only thing we ask is that you know your own code.
+Built around one rule: **a wrong number is worse than no number.** Every 200
+carries a rate the ECB actually published, together with the day that rate
+belongs to. Everything else is a refusal with a status and a code.
 
-**Start by clicking "Use this template"** to create your own repository, then
-work there.
+## Run
 
----
+```bash
+./run.sh                                        # http://localhost:8080
+PORT=9000 ./run.sh
+FX_UPSTREAM_BASE=http://localhost:9999 ./run.sh
+```
 
-## Part A — build (about 90 minutes)
+Config order: **environment → `.env` → `.env.example`**. No provider host is
+written in the Python; the committed `.env.example` carries the documented
+default, `.env` is local and untracked, and the environment beats both.
 
-A small HTTP service — Python + FastAPI preferred, TypeScript is fine — with one
-endpoint an AI agent could call as a tool:
+**One thing to know:** the real API serves under `/v1`, which the documented
+default base does not include. Rather than assume, the service tries
+`<base>/v1/…`, falls back to `<base>/…`, and remembers whichever answered — so a
+fake upstream can serve at either.
+
+## Test
+
+```bash
+./test.sh
+```
+
+120 tests, no network at all: every upstream response comes from an
+`httpx.MockTransport`. Confirmed green with `FX_UPSTREAM_BASE` pointed at a
+closed port.
+
+## The endpoint
 
 ```
 GET /tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28
 ```
 
-It answers using the public [Frankfurter API](https://frankfurter.dev) —
-European Central Bank rates, no API key, no signup.
-
-### Three things are fixed, so that we can run every submission the same way
-
-| | |
-|---|---|
-| Upstream URL | from the `FX_UPSTREAM_BASE` environment variable, defaulting to `https://api.frankfurter.dev`. **Nothing may hardcode the real host** — we point this at a fake upstream when reviewing. |
-| Port | from the `PORT` environment variable, default `8080` |
-| Scripts | `./run.sh` starts the service, `./test.sh` runs the tests. Both are in this template, unimplemented. |
-
-### The response
-
-On success, 200 with:
+`date` is optional — omit it for the latest published rate. Codes are
+case-insensitive.
 
 ```json
 {
   "amount": 250,
   "from": "EUR",
   "to": "TRY",
-  "rate": 47.1234,
-  "result": 11780.85,
+  "rate": 56.1718,
+  "result": 14042.95,
   "rate_date": "2026-08-28",
   "asked_date": "2026-08-28",
   "source": "ECB via frankfurter.dev"
 }
 ```
 
-`rate_date` is **the date the rate you used actually belongs to.** `asked_date`
-is what the caller asked for. They are not always the same, and that difference
-is the point of this task.
+- **`rate_date`** — the day the rate belongs to, read from the provider's own
+  `date` field. Never derived.
+- **`asked_date`** — the day you asked about; with no `date`, today. So asking
+  "what is it now?" on a Saturday still shows the rate is Friday's.
 
-On failure, a non-2xx status and:
+When they differ, the rate is from an earlier publication. Failures return a
+status and:
 
 ```json
-{ "error": "<short_machine_code>", "message": "<a sentence a person could read>" }
+{ "error": "date_in_future", "message": "2030-01-01 is in the future; the ECB has not published a rate for it." }
 ```
 
-List your error codes in your README.
+## What it does in each case
 
-### The part that matters
+| You ask about | It answers |
+|---|---|
+| A day the ECB published | `200`, `rate_date == asked_date` |
+| **A weekend or holiday** | `200` with the last publication before it, and `rate_date` is that earlier day |
+| Nothing (`date` omitted) | `200` for the latest publication, with `asked_date` set to today |
+| A date in the future | `400 date_in_future`, refused without touching the upstream |
+| A date before the series starts | `404 no_rate_for_date` |
+| A currency code that does not exist | `404 unknown_currency` (or `400 invalid_currency` if it is not three letters) |
+| The same currency twice | `400 same_currency` |
+| An amount that is missing, zero, negative, `nan`, `inf`, or written as `250_0` | `400 invalid_amount`, no upstream request |
+| An amount with ten decimal places | `200`. Kept exact end to end as a `Decimal`; only `result` is rounded, to 2 places, half up |
+| A `date` that is a bare number, or given twice | `400`. Pydantic would read `1756339200` as a Unix timestamp and answer about a different day |
+| An upstream that is slow, down, returns 500, or returns something that is not JSON | `502` or `504`. Never a rate, never a zero |
+| An upstream that answers a *different* question — wrong base currency, rates quoted per 100, a missing or later date, an implausible rate | `502 upstream_invalid_response` |
+| An upstream whose newest rate is more than ten days older than the day asked about | `404 rate_unavailable`. A holiday gap is normal; a frozen mirror is not |
 
-The caller is a language model talking to a paying customer, so **a wrong number
-is worse than no number.** Decide — and implement — what happens when:
+## Error codes
 
-- the ECB published no rate for the date asked (weekends, holidays);
-- the date is in the future, or before the series starts;
-- the currency code does not exist, or `from` and `to` are the same;
-- the upstream is slow, returns 500, or returns something that is not JSON;
-- `amount` is missing, zero, negative, or has ten decimal places.
+| Code | HTTP | Raised when |
+|---|---|---|
+| `invalid_amount` | 400 | `amount` missing, not a plain number, ≤ 0, non-finite, or above 1e12 |
+| `invalid_currency` | 400 | `from`/`to` is not three letters |
+| `invalid_date` | 400 | `date` is not a calendar date written as `YYYY-MM-DD` |
+| `invalid_request` | 400 | A parameter was given more than once |
+| `unknown_parameter` | 400 | A query parameter this endpoint does not accept |
+| `date_in_future` | 400 | `date` is after today (Europe/Berlin) |
+| `same_currency` | 400 | `from` and `to` are the same |
+| `unknown_currency` | 404 | The code is well formed but the ECB does not publish it |
+| `no_rate_for_date` | 404 | Both codes are known, but no rate exists for that day |
+| `rate_unavailable` | 404 | No usable rate, and either the upstream offers no currency list to say why, or the newest one is too old to serve |
+| `unknown_endpoint` / `method_not_allowed` | 404 / 405 | Wrong path or method |
+| `upstream_unavailable` | 502 | Could not reach the provider |
+| `upstream_error` | 502 | The provider returned an unexpected status |
+| `upstream_invalid_response` | 502 | The provider's answer did not survive validation |
+| `upstream_timeout` | 504 | The provider did not answer in time |
+| `internal_error` | 500 | An unexpected fault; no rate is produced |
 
-Your endpoint must never invent a rate, and must never present a rate as
-belonging to a date it does not belong to. Note that the upstream itself tells
-you which date its rates are from — read it. If you choose to answer with an
-earlier published rate, the response has to make that visible, because the model
-has to be able to tell the customer which day the number is from.
+## Decisions worth knowing
 
-### Also required
+- **`from == to` is an error, not `1.0`** — answering would put a rate in a 200
+  that no ECB publication stands behind, and date it. The message says the
+  amount is unchanged, so the model can still answer.
+- **The provider's answer is checked before it is believed:** base currency
+  matches, rates quoted per one unit, requested currency present, rate finite
+  and plausible. Reading `rates[to]` without that is how a service reports one
+  currency's rate as another's.
+- **A repeat does not re-ask the provider.** The key is `(from, to, date)` — not
+  just the pair — so a question about 2015 can never be answered with today's
+  rate. A day already over is kept indefinitely; anything else for five minutes.
+- **`source` is a provenance label,** not the address fetched from, so it does
+  not follow `FX_UPSTREAM_BASE`.
 
-- **Tests that pass with no network at all** — fake the upstream. We run
-  `./test.sh` with `FX_UPSTREAM_BASE` pointing at a closed port.
-- A README of your own we can follow in under a minute: how to run it, how to
-  run the tests, your error codes, and what your endpoint does in each of the
-  cases above.
-- A repeat of the same question should not re-ask the upstream.
-- `NOTES.md`, one page. The skeleton is in this repo.
+### Known limits
 
-### Not required, not scored
-
-Auth, a database, a UI, a Dockerfile, CI, deployment, more endpoints. Adding them
-will not help you; a smaller thing done carefully will.
-
----
-
-## Part B — review (about 45 minutes)
-
-`tool.py` in this repository is a working version of the same service, written
-quickly with an AI assistant. It runs. **Review it as if it were going live
-tomorrow for a customer who pays us.**
-
-Fill in `REVIEW.md`, one page:
-
-- what is wrong, and what it does to a **customer** — not to a linter;
-- how you would verify each finding;
-- your findings **ranked**, and which single one you would fix before shipping
-  tonight.
-
-Fewer findings, ranked and explained, beat a long list. If something looks
-suspicious but is actually fine, saying so is worth as much as finding a real
-defect.
-
----
-
-## Submitting
-
-Reply to our email with a link to your repository. Commit in small steps — the
-history is part of what we read. Five days is plenty; if you need more, just say
-so.
-
-Any question about this brief, ask. An unclear requirement is our fault, not a
-test.
-
----
-
-<sub>mangolab — Mango Yazılım Teknolojileri Ltd. Şti. · [mangolab.ai/careers](https://mangolab.ai/careers)</sub>
+`result` is rounded to two decimals for every currency, which is wrong for JPY.
+No retries. No single-flight, so "does not re-ask" holds for sequential calls;
+two simultaneous identical requests will both go out. The currency list is
+fetched once and kept for the life of the process. `/tools/convert` is the only
+endpoint written here; FastAPI's own `/docs` and `/openapi.json` are left on,
+since the schema is how an agent discovers the tool. No auth or rate limiting —
+none was asked for.
